@@ -123,39 +123,148 @@ def save_masks(outputs_per_frame, frames, output_dir: Path):
             )
 
 
-def _collect_outputs(predictor, inference_state, prompt_frame):
+def _collect_outputs(model, inference_state, prompt_frame, output_dir: Path):
     outputs_per_frame = {}
 
-    for frame_idx, obj_ids, _, video_res_masks, _ in predictor.propagate_in_video(
+    def _mask_to_numpy(mask):
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.detach().cpu().numpy()
+        else:
+            mask_np = np.asarray(mask)
+        if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        return mask_np
+
+    for item in model.propagate_in_video(
+        inference_state=inference_state,
+        start_frame_idx=prompt_frame,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        frame_idx, out = item
+        if out is None:
+            continue
+        if "obj_id_to_mask" in out:
+            frame_out = {
+                int(obj_id): mask.detach().cpu().numpy()
+                for obj_id, mask in out["obj_id_to_mask"].items()
+            }
+        elif "out_obj_ids" in out and ("out_mask_logits" in out or "out_binary_masks" in out):
+            obj_ids = out["out_obj_ids"]
+            masks = out.get("out_mask_logits", None)
+            if masks is None:
+                masks = out.get("out_binary_masks", None)
+            frame_out = {}
+            for i, obj_id in enumerate(obj_ids):
+                mask_i = masks[i]
+                mask_np = _mask_to_numpy(mask_i)
+                frame_out[int(obj_id)] = mask_np
+        else:
+            frame_out = {}
+        outputs_per_frame[frame_idx] = frame_out
+
+    for item in model.propagate_in_video(
+        inference_state=inference_state,
+        start_frame_idx=prompt_frame,
+        max_frame_num_to_track=None,
+        reverse=True,
+    ):
+        frame_idx, out = item
+        if frame_idx in outputs_per_frame or out is None:
+            continue
+        if "obj_id_to_mask" in out:
+            frame_out = {
+                int(obj_id): mask.detach().cpu().numpy()
+                for obj_id, mask in out["obj_id_to_mask"].items()
+            }
+        elif "out_obj_ids" in out and ("out_mask_logits" in out or "out_binary_masks" in out):
+            obj_ids = out["out_obj_ids"]
+            masks = out.get("out_mask_logits", None)
+            if masks is None:
+                masks = out.get("out_binary_masks", None)
+            frame_out = {}
+            for i, obj_id in enumerate(obj_ids):
+                mask_i = masks[i]
+                mask_np = _mask_to_numpy(mask_i)
+                frame_out[int(obj_id)] = mask_np
+        else:
+            frame_out = {}
+        outputs_per_frame[frame_idx] = frame_out
+
+    return outputs_per_frame
+
+
+def _collect_outputs_tracker(predictor, inference_state, prompt_frame):
+    outputs_per_frame = {}
+
+    def _mask_to_numpy(mask):
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.detach().cpu().numpy()
+        else:
+            mask_np = np.asarray(mask)
+        if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        return mask_np
+
+    def _from_out_dict(out):
+        if out is None or not isinstance(out, dict):
+            return {}
+        if "obj_id_to_mask" in out:
+            return {int(obj_id): _mask_to_numpy(mask) for obj_id, mask in out["obj_id_to_mask"].items()}
+        if "out_obj_ids" in out:
+            obj_ids = out["out_obj_ids"]
+            masks = out.get("out_mask_logits", None)
+            if masks is None:
+                masks = out.get("out_binary_masks", None)
+            if masks is None:
+                return {}
+            frame_out = {}
+            for i, obj_id in enumerate(obj_ids):
+                frame_out[int(obj_id)] = _mask_to_numpy(masks[i])
+            return frame_out
+        return {}
+
+    def _normalize_item(item):
+        if isinstance(item, tuple):
+            if len(item) == 2:
+                frame_idx, out = item
+                return frame_idx, _from_out_dict(out)
+            if len(item) >= 4:
+                frame_idx, obj_ids, _, video_res_masks, *rest = item
+                frame_out = {}
+                if video_res_masks is not None:
+                    for i, obj_id in enumerate(obj_ids):
+                        frame_out[int(obj_id)] = _mask_to_numpy(video_res_masks[i, 0])
+                return frame_idx, frame_out
+        if isinstance(item, dict):
+            frame_idx = item.get("frame_idx", item.get("frame_index", None))
+            return frame_idx, _from_out_dict(item)
+        return None, {}
+
+    for item in predictor.propagate_in_video(
         inference_state=inference_state,
         start_frame_idx=prompt_frame,
         max_frame_num_to_track=None,
         reverse=False,
         propagate_preflight=True,
     ):
-        frame_out = {}
-        if video_res_masks is not None:
-            for i, obj_id in enumerate(obj_ids):
-                frame_out[int(obj_id)] = video_res_masks[i, 0].detach().cpu().numpy()
+        frame_idx, frame_out = _normalize_item(item)
+        if frame_idx is None:
+            continue
         outputs_per_frame[frame_idx] = frame_out
 
-    for frame_idx, obj_ids, _, video_res_masks, _ in predictor.propagate_in_video(
+    for item in predictor.propagate_in_video(
         inference_state=inference_state,
         start_frame_idx=prompt_frame,
         max_frame_num_to_track=None,
         reverse=True,
-        propagate_preflight=False,
     ):
-        if frame_idx in outputs_per_frame:
+        frame_idx, frame_out = _normalize_item(item)
+        if frame_idx is None or frame_idx in outputs_per_frame:
             continue
-        frame_out = {}
-        if video_res_masks is not None:
-            for i, obj_id in enumerate(obj_ids):
-                frame_out[int(obj_id)] = video_res_masks[i, 0].detach().cpu().numpy()
         outputs_per_frame[frame_idx] = frame_out
 
     return outputs_per_frame
-
 
 def main():
     args = parse_args()
@@ -166,6 +275,8 @@ def main():
     prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
     prompt_frame = int(prompts.get("prompt_frame", 0))
     objects = prompts.get("objects", [])
+    # Text prompts are disabled for this pipeline; rely on points/boxes only.
+    text_prompt = None
 
     if "frame_size" in prompts:
         width, height = prompts["frame_size"]
@@ -221,7 +332,7 @@ def main():
             rel_coordinates=True,
         )
 
-    outputs_per_frame = _collect_outputs(predictor, inference_state, prompt_frame)
+    outputs_per_frame = _collect_outputs_tracker(predictor, inference_state, prompt_frame)
     save_masks(outputs_per_frame, frames, output_dir)
     print(f"Saved masks to {output_dir}")
 
